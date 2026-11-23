@@ -91,21 +91,35 @@ are flowing; on a quiet DB the final query of a burst can take up to ~30 s to
 appear. Any further lag you see in QAN is PMM's own ingestion interval, not
 this daemon.
 
-Restarts don't lose slow queries. Whenever the daemon is stopped (by systemd,
-when restarted along with rsyslog, at a reboot, or when `setup.sh` re-runs),
-it saves its place in the incoming log and any half-delivered blocks to
-`/var/lib/mysql_sink/slow-query-sink/position.json`. The next start resumes
-exactly there, even if logrotate rotated the incoming log in between, so
-nothing is skipped and nothing is written twice. Two cases still start at the
-end of the incoming log, and the journal says so with a warning:
+Restarting the daemon doesn't lose slow queries. Whenever it's stopped (by
+systemd, when restarted along with rsyslog, at a reboot, or when `setup.sh`
+re-runs), it saves its place in the incoming log and any half-delivered
+blocks to `/var/lib/mysql_sink/slow-query-sink/position.json`. The next start
+resumes exactly there, even if logrotate rotated the incoming log in between,
+so nothing is skipped and nothing is written twice. Two cases still start at
+the end of the incoming log, and the journal says so with a warning:
 
 - a run that was killed and never got to save (SIGKILL, the unit's memory
   limit, power loss);
 - a stop long enough for the saved file to be rotated away twice.
 
-This covers what reached the incoming log. Whether DO's forwarder resends
-messages while rsyslog itself is down, for example during a reboot, is
-outside the sink's control.
+The parts on either side of the daemon behave differently when they restart:
+
+- **DO's forwarder** can't deliver while rsyslog is down, for example during
+  a sink reboot. In testing it delivered everything from a ~20-second reboot
+  once rsyslog was back, with no gap. DO doesn't document how long it holds
+  messages.
+- **PMM's slowlog agent** (pmm-agent 3.10) adds up queries a minute at a time
+  and drops the minute in progress when it stops. When it starts, it reads
+  only what's written after it opens the slow log. (See
+  `agent/agents/mysql/slowlog/slowlog.go` and
+  `agent/utils/filereader/continuous_file_reader.go` in percona/pmm v3.10.0.)
+  So QAN can be short of up to about a minute of queries whenever pmm-agent
+  or its slowlog agent restarts: a sink reboot, `systemctl restart
+  pmm-agent`, or a `setup.sh` re-run, which re-registers the service. The
+  queries are all in `native_slow_query.log`; the sink can't change what PMM
+  does with them. On a test sink rebooted 49 seconds into a minute, QAN came
+  up 23 queries short, that minute's queries up to the reboot.
 
 ## Deployment model: one sink Droplet per endpoint, no HA
 

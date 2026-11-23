@@ -7,6 +7,7 @@ Everything here is synthetic RFC3164 input; nothing touches the network or the
 real /var/log/mysql_sink paths.
 """
 import io
+import json
 import os
 import sys
 import tempfile
@@ -253,24 +254,50 @@ class LineReaderTests(unittest.TestCase):
         self.assertEqual(tl._drop_counts.get("oversized line"), 1)
 
 
-class DaemonLoopTests(unittest.TestCase):
-    """Drive run() for real against temp files, to cover file-rotation handling."""
+class _DaemonHarness(unittest.TestCase):
+    """Drive run() for real, in a thread, against temp files."""
+
+    BLOCK_TTL = 0.5  # short, so stale-finalization happens within a test
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         d = self.tmp.name
         self.incoming = os.path.join(d, "incoming", "combined_mysql.log")
         self.output = os.path.join(d, "processed", "native_slow_query.log")
+        self.state = os.path.join(d, "state", "position.json")
         os.makedirs(os.path.dirname(self.incoming))
         open(self.incoming, "w").close()
-        self._saved = (tl.COMBINED_FILE, tl.SLOW_LOG_OUTPUT, tl.BLOCK_TTL)
-        tl.COMBINED_FILE, tl.SLOW_LOG_OUTPUT = self.incoming, self.output
-        tl.BLOCK_TTL = 0.5  # so stale-finalization happens within the test
-        tl._running = True
+        self._saved = (tl.COMBINED_FILE, tl.SLOW_LOG_OUTPUT, tl.STATE_FILE, tl.BLOCK_TTL)
+        tl.COMBINED_FILE, tl.SLOW_LOG_OUTPUT, tl.STATE_FILE = self.incoming, self.output, self.state
+        tl.BLOCK_TTL = self.BLOCK_TTL
         reset_drop_counters()
+        self.thread = None
+        self._start_daemon()
+
+    def _start_daemon(self):
+        """Start run() and wait until it's positioned on the input, which is
+        when it writes its "running" marker."""
+        ready = threading.Event()
+        orig = tl._mark_running
+
+        def mark_running():
+            orig()
+            ready.set()
+
+        tl._mark_running = mark_running
+        tl._running = True
         self.thread = threading.Thread(target=self._run_quietly, daemon=True)
         self.thread.start()
-        self._wait_for(lambda: os.path.exists(self.output))
+        try:
+            self.assertTrue(ready.wait(5), "daemon didn't start")
+        finally:
+            tl._mark_running = orig
+
+    def _stop_daemon(self):
+        """What systemd's SIGTERM does: the loop exits and run() saves its place."""
+        tl._running = False
+        self.thread.join(timeout=5)
+        self.assertFalse(self.thread.is_alive(), "daemon didn't stop")
 
     def _run_quietly(self):
         # run() installs SIGTERM/SIGINT handlers, which only works on the main
@@ -283,9 +310,10 @@ class DaemonLoopTests(unittest.TestCase):
             tl.signal.signal = orig
 
     def tearDown(self):
-        tl._running = False
-        self.thread.join(timeout=5)
-        tl.COMBINED_FILE, tl.SLOW_LOG_OUTPUT, tl.BLOCK_TTL = self._saved
+        if self.thread is not None and self.thread.is_alive():
+            tl._running = False
+            self.thread.join(timeout=5)
+        tl.COMBINED_FILE, tl.SLOW_LOG_OUTPUT, tl.STATE_FILE, tl.BLOCK_TTL = self._saved
         self.tmp.cleanup()
 
     @staticmethod
@@ -305,6 +333,13 @@ class DaemonLoopTests(unittest.TestCase):
     def _read(path):
         with open(path) as f:
             return f.read()
+
+    def _let_daemon_poll(self):
+        time.sleep(tl.POLL_INTERVAL * 4)
+
+
+class DaemonLoopTests(_DaemonHarness):
+    """File-rotation handling and partial-line reads."""
 
     def test_last_block_of_a_burst_reaches_output(self):
         self._append_input(block_lines("db-1", 1, QUERY_A))
@@ -335,9 +370,6 @@ class DaemonLoopTests(unittest.TestCase):
         with open(self.incoming, "w") as f:
             f.writelines(block_lines("db-1", 2, QUERY_B))
         self._wait_for(lambda: self._read(self.output) == expected(QUERY_A, QUERY_B))
-
-    def _let_daemon_poll(self):
-        time.sleep(tl.POLL_INTERVAL * 4)
 
     def test_line_cut_mid_write_is_reassembled(self):
         # rsyslog's write() lands in the file a page at a time, so the daemon
@@ -376,6 +408,198 @@ class DaemonLoopTests(unittest.TestCase):
             f.writelines(block_lines("db-1", 2, QUERY_B))
         self._wait_for(lambda: self._read(self.output) == expected(QUERY_B))
         self.assertEqual(tl._drop_counts.get("incomplete line at input rotation"), 1)
+
+
+def query(n):
+    """A distinct three-line slow-log entry."""
+    return [f"# Time: 2026-11-12T21:10:{n:02d}.000000Z", f"# Query_time: 0.{n}  Lock_time: 0.0",
+            f"SELECT {n};"]
+
+
+def qlines(n, upto=None):
+    """Forwarded lines for query(n) as block n, optionally only the first `upto`."""
+    return block_lines("db-1", n, query(n))[:upto]
+
+
+class ResumeTests(_DaemonHarness):
+    """Stop and restart run(): it must carry on exactly where it stopped."""
+
+    # Long enough that nothing goes stale mid-test, so in-flight blocks are
+    # still in flight at a stop. Blocks are finalized by the next one starting.
+    BLOCK_TTL = 10.0
+
+    def _saved_state(self):
+        with open(self.state) as f:
+            return json.load(f)
+
+    def _restart(self, while_stopped=()):
+        self._stop_daemon()
+        self._append_input(while_stopped)
+        self._start_daemon()
+
+    def _assert_output(self, *ns, since=0):
+        want = expected(*(query(n) for n in ns))
+        self._wait_for(lambda: self._read(self.output)[since:] == want)
+        self._let_daemon_poll()
+        self.assertEqual(self._read(self.output)[since:], want)
+
+    def _write_raw_state(self, data):
+        with open(self.state, "w") as f:
+            f.write(data)
+
+    def test_restart_mid_block_loses_nothing_and_duplicates_nothing(self):
+        self._append_input(qlines(1) + qlines(2, 1))  # 1 complete, 2 just begun
+        self._wait_for(lambda: self._read(self.output) == expected(query(1)))
+        self._stop_daemon()
+        self.assertEqual(len(self._saved_state()["blocks"]), 1, "block 2 should be saved in flight")
+        # The rest of block 2, and more, arrive while the daemon is down.
+        self._append_input(qlines(2)[1:] + qlines(3) + qlines(4, 1))
+        self._start_daemon()
+        self._assert_output(1, 2, 3)
+        self.assertEqual(tl._drop_counts, {})
+
+    def test_restart_with_a_line_half_read(self):
+        lines = qlines(1)
+        self._append_input(lines[:1] + [lines[1][:20]])
+        self._let_daemon_poll()
+        self._restart(while_stopped=[lines[1][20:]] + lines[2:] + qlines(2, 1))
+        self._assert_output(1)
+        self.assertEqual(tl._drop_counts, {})
+
+    def test_input_rotated_while_stopped(self):
+        self._append_input(qlines(1, 2))
+        self._let_daemon_poll()
+        self._stop_daemon()
+        self._append_input(qlines(1)[2:])          # still into the old file
+        os.rename(self.incoming, self.incoming + ".1")
+        with open(self.incoming, "w") as f:
+            f.writelines(qlines(2) + qlines(3, 1))
+        self._start_daemon()
+        self._assert_output(1, 2)
+        self.assertEqual(tl._drop_counts, {})
+
+    def test_stopped_while_waiting_for_the_rotated_file(self):
+        self._append_input(qlines(1) + qlines(2))  # 2 stays in flight: nothing follows it
+        self._wait_for(lambda: self._read(self.output) == expected(query(1)))
+        os.rename(self.incoming, self.incoming + ".1")   # rsyslog hasn't recreated it yet
+        time.sleep(tl.POLL_INTERVAL * 4)                 # daemon notices, waits for the new file
+        self._stop_daemon()
+        with open(self.incoming, "w") as f:
+            f.writelines(qlines(3) + qlines(4, 1))
+        self._start_daemon()
+        self._assert_output(1, 2, 3)
+        self.assertEqual(tl._drop_counts, {})
+
+    def test_saved_file_gone_reads_current_file_from_start(self):
+        self._append_input(qlines(1, 2))   # 1 in flight, lines 1-2 of 3: looks gap-free
+        self._let_daemon_poll()
+        self._stop_daemon()
+        os.rename(self.incoming, self.incoming + ".2")   # rotated twice: not at .1 any more
+        with open(self.incoming, "w") as f:
+            f.writelines(qlines(2) + qlines(3, 1))
+        with self.assertLogs(tl.log, "WARNING") as logs:
+            self._start_daemon()
+        self.assertIn("gone or has changed", "\n".join(logs.output))
+        # Block 1 must not be restored: it would be written truncated.
+        self._assert_output(2)
+
+    def test_same_inode_new_content_is_not_resumed(self):
+        self._append_input(qlines(1, 2))
+        self._let_daemon_poll()
+        self._stop_daemon()
+        with open(self.incoming, "w") as f:        # truncate + rewrite: same inode
+            f.writelines(qlines(2) + qlines(3, 1))
+        with self.assertLogs(tl.log, "WARNING") as logs:
+            self._start_daemon()
+        self.assertIn("gone or has changed", "\n".join(logs.output))
+        self._assert_output(2)
+
+    def test_killed_run_restarts_at_end_with_a_warning(self):
+        self._append_input(qlines(1) + qlines(2, 1))
+        self._wait_for(lambda: self._read(self.output) == expected(query(1)))
+        self._stop_daemon()
+        # A killed run never saves, so all the next start finds is the marker.
+        self._write_raw_state(json.dumps({"version": tl.STATE_VERSION, "running": True}))
+        self._append_input(qlines(2)[1:] + qlines(3))   # logged while it was down: skipped
+        with self.assertLogs(tl.log, "WARNING") as logs:
+            self._start_daemon()
+        self.assertIn("without saving its position", "\n".join(logs.output))
+        self._append_input(qlines(4) + qlines(5, 1))
+        self._assert_output(1, 4)
+
+    def test_unusable_state_restarts_at_end_with_a_warning(self):
+        good = None
+        bad_states = {
+            "not json": "{not json",
+            "not an object": "[1, 2]",
+            "unknown version": json.dumps({"version": 99}),
+            "missing field": json.dumps({"version": tl.STATE_VERSION, "ino": 1}),
+            "bad block": None,   # filled in from a real saved state below
+        }
+        for n, (name, data) in enumerate(bad_states.items(), 1):
+            with self.subTest(state=name):
+                self._stop_daemon()
+                if good is None:
+                    good = self._saved_state()
+                if data is None:
+                    state = dict(good, blocks=[["db-1", "not-an-int", 0, {}]])
+                    data = json.dumps(state)
+                self._write_raw_state(data)
+                before = len(self._read(self.output))
+                self._append_input(qlines(10 * n))       # logged while it was down: skipped
+                with self.assertLogs(tl.log, "WARNING") as logs:
+                    self._start_daemon()
+                self.assertIn("unusable", "\n".join(logs.output))
+                self._append_input(qlines(10 * n + 1) + qlines(10 * n + 2, 1))
+                self._assert_output(10 * n + 1, since=before)
+
+    def test_first_start_begins_at_end_of_existing_input(self):
+        self._stop_daemon()
+        os.remove(self.state)
+        self._append_input(qlines(1))    # already there before the first start
+        with self.assertLogs(tl.log, "INFO") as logs:
+            self._start_daemon()
+        self.assertIn("No saved position", "\n".join(logs.output))
+        self._append_input(qlines(2) + qlines(3, 1))
+        self._assert_output(2)
+
+    def test_output_open_failure_keeps_saved_position(self):
+        self._append_input(qlines(1, 2))
+        self._let_daemon_poll()
+        self._stop_daemon()
+        saved = self._saved_state()
+
+        def refuse(path):
+            raise PermissionError("denied")
+
+        orig = tl._open_output
+        tl._open_output = refuse
+        try:
+            tl._running = True
+            with self.assertRaises(PermissionError):
+                self._run_quietly()
+        finally:
+            tl._open_output = orig
+        self.assertEqual(self._saved_state(), saved, "a failed start must not use up the position")
+
+    def test_state_file_is_private(self):
+        self._stop_daemon()
+        self.assertEqual(os.stat(self.state).st_mode & 0o777, 0o600)
+
+    def test_oversized_state_saves_position_without_blocks(self):
+        self._append_input([syslog_line("db-1", 1, 1, "x" * 2000)])
+        self._let_daemon_poll()
+        old = tl.MAX_STATE_BYTES
+        tl.MAX_STATE_BYTES = 1000
+        try:
+            with self.assertLogs(tl.log, "WARNING") as logs:
+                self._stop_daemon()
+        finally:
+            tl.MAX_STATE_BYTES = old
+        self.assertIn("too large to save", "\n".join(logs.output))
+        state = self._saved_state()
+        self.assertEqual(state["blocks"], [])
+        self.assertEqual(state["offset"], os.path.getsize(self.incoming))
 
 
 if __name__ == "__main__":

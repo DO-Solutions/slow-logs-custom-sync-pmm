@@ -14,7 +14,8 @@
 #   - rsyslog: the mTLS listener config + its cert/key/CA copies
 #   - the slow_query_log_file symlink on the DB side (best-effort, needs the
 #     DB to still be reachable to resolve the path)
-#   - /etc/mysql_sink, /var/log/mysql_sink, logrotate config, the mysqlsink
+#   - /etc/mysql_sink, /var/log/mysql_sink, /var/lib/mysql_sink (symlink
+#     record, the daemon's saved position), logrotate config, the mysqlsink
 #     system user, the ufw rules setup.sh added
 #
 # It deliberately does NOT uninstall shared system packages (pmm-client,
@@ -81,7 +82,7 @@ echo "  - PMM: the '${PMM_SERVICE_NAME}' service + this node's registration/agen
 echo "  - systemd: slow-query-sink.service, socat-mysql-proxy.service, mysql-sink-reconcile.timer"
 echo "  - rsyslog: the mTLS listener config + its cert/key/CA copies"
 echo "  - the slow_query_log_file symlink on the DB side (if resolvable)"
-echo "  - /etc/mysql_sink, logrotate config, the mysqlsink system user"
+echo "  - /etc/mysql_sink, /var/lib/mysql_sink, logrotate config, the mysqlsink system user"
 if [ "$KEEP_LOGS" -eq 0 ]; then
   echo "  - /var/log/mysql_sink (incoming + processed logs)"
 else
@@ -187,7 +188,7 @@ fi
 echo "==> 7/9 Removing DO CA bundle and mysql_sink directories"
 run "remove DO CA bundle" rm -f "$DO_CA_BUNDLE"
 run "remove reconcile DB options file" rm -f /etc/mysql_sink/reconcile.cnf
-run "remove /var/lib/mysql_sink (symlink record)" rm -rf /var/lib/mysql_sink
+run "remove /var/lib/mysql_sink (symlink record, daemon's saved position)" rm -rf /var/lib/mysql_sink
 run "remove /etc/mysql_sink (if now empty)" rmdir --ignore-fail-on-non-empty "$(dirname "$DO_CA_BUNDLE")"
 if [ "$KEEP_LOGS" -eq 1 ]; then
   echo "  --keep-logs set — leaving /var/log/mysql_sink in place."

@@ -91,6 +91,22 @@ are flowing; on a quiet DB the final query of a burst can take up to ~30 s to
 appear. Any further lag you see in QAN is PMM's own ingestion interval, not
 this daemon.
 
+Restarts don't lose slow queries. Whenever the daemon is stopped (by systemd,
+when restarted along with rsyslog, at a reboot, or when `setup.sh` re-runs),
+it saves its place in the incoming log and any half-delivered blocks to
+`/var/lib/mysql_sink/slow-query-sink/position.json`. The next start resumes
+exactly there, even if logrotate rotated the incoming log in between, so
+nothing is skipped and nothing is written twice. Two cases still start at the
+end of the incoming log, and the journal says so with a warning:
+
+- a run that was killed and never got to save (SIGKILL, the unit's memory
+  limit, power loss);
+- a stop long enough for the saved file to be rotated away twice.
+
+This covers what reached the incoming log. Whether DO's forwarder resends
+messages while rsyslog itself is down, for example during a reboot, is
+outside the sink's control.
+
 ## Deployment model: one sink Droplet per endpoint, no HA
 
 "Single sink" means **one sink per DB endpoint**. Each endpoint DO lets you

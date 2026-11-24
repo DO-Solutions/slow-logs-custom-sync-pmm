@@ -320,11 +320,12 @@ bash setup.sh
 8. Registers the MySQL service (`PMM_SERVICE_NAME`) in PMM with `--query-source=slowlog` and any labels set in `.env`, and verifies it actually appears in `pmm-admin list`.
 
 It's idempotent — safe to re-run after fixing a config issue, and after a
-`git pull` to pick up fixes: a re-run restarts `slow-query-sink` and the
+`git pull` to pick up fixes: a re-run restarts rsyslog, `slow-query-sink` and the
 `socat` proxy so they run the new code/config (the daemon resumes the
-incoming log where it stopped, so its restart doesn't skip slow queries;
-QAN can still miss up to a minute while PMM's agent is re-registered, see
-Troubleshooting), keeps the existing PMM node
+incoming log where it stopped, so its restart doesn't skip slow queries.
+QAN can still miss up to a minute while PMM's agent is re-registered, and
+the rsyslog restart can drop a second or two of what DO was sending at that
+moment; see Troubleshooting and docs/architecture.md), keeps the existing PMM node
 (same node ID), and re-registers the MySQL service under the same name so it
 picks up the current `.env` (e.g. a new `DB_PASS` after a DB replacement, or
 changed labels). QAN history stays available under the service name; the
@@ -640,6 +641,7 @@ applies, rather than you needing to guess from the symptom alone.
 | Daemon not running | `systemctl status slow-query-sink` and `journalctl -u slow-query-sink -n 50` |
 | "Discarding stale incomplete block" in daemon logs | A multi-line slow query block arrived with missing lines — likely a transient rsyslog drop; normal at low frequency. (Older versions of `transform_logs.py` also logged this for the last, *complete* query before every quiet period — and dropped it — and logged every host as `host=unknown`. If you see `host=unknown`, you're on old code: `git pull && bash setup.sh`.) |
 | "Dropping input: finalized block has gaps" in daemon logs | A slow query's lines didn't all reach the sink, so it was left out rather than written half-built. `occurrences=` is the running count since the daemon started; each reason is logged at most once a minute. Older versions of `transform_logs.py` caused this themselves: they could read a line rsyslog was still writing and lose it (on the test sinks, one slow query every 5–10 hours; how often depends on traffic). They also logged only the 1st and every 1000th drop, so most went unseen. Fix: `git pull && bash setup.sh`. On current code, an occasional occurrence means lines really were missing from the forwarded stream |
+| The sink was down for a while (stopped, powered off, resized), and since it's been back nothing new reaches `combined_mysql.log` for many minutes, although rsyslog is running and listening on 6514 | Most likely DO's forwarder is waiting before it retries; after a long outage that can take many minutes. In testing, after a 15-minute outage it reconnected 12 minutes after rsyslog was back, then delivered the whole backlog with nothing missing. Check that this is what's happening: `ss -tn '( sport = :6514 )'` shows no connection, and `journalctl -u rsyslog` shows no handshake errors. Then wait: it reconnects on its own. If nothing has arrived after an hour, far longer than anything seen in testing, work through the `combined_mysql.log` row above |
 | QAN is short of up to about a minute of queries around a sink reboot, a `pmm-agent` restart or a `setup.sh` re-run, although `native_slow_query.log` has them | Expected, and PMM's own behaviour. Its slowlog agent drops the minute it's adding up when it stops, and reads only what's written after it starts (see docs/architecture.md, "Why a daemon instead of a per-minute batch job"). Nothing to fix on the sink |
 | "The previous run stopped without saving its position" in daemon logs | The daemon was killed rather than stopped, so it couldn't save its place in `combined_mysql.log`. Causes: `kill -9`, the unit's `MemoryMax=256M` (look for `oom` in `journalctl -u slow-query-sink` and `dmesg`), or a hard power-off. It started at the end of the file, so slow queries that arrived while it was down are missing from QAN. Once is harmless; if it keeps happening, find what is killing it |
 | "The file the saved position is in is gone or has changed" in daemon logs | The daemon was stopped long enough for logrotate to rotate `combined_mysql.log` twice (more than a day), or the file was replaced. The daemon read the current file from the start, so slow queries in the rotated-away file are missing from QAN |

@@ -91,6 +91,61 @@ are flowing; on a quiet DB the final query of a burst can take up to ~30 s to
 appear. Any further lag you see in QAN is PMM's own ingestion interval, not
 this daemon.
 
+Restarting the daemon doesn't lose slow queries. Whenever it's stopped (by
+systemd, when restarted along with rsyslog, at a reboot, or when `setup.sh`
+re-runs), it saves its place in the incoming log and any half-delivered
+blocks to `/var/lib/mysql_sink/slow-query-sink/position.json`. The next start
+resumes exactly there, even if logrotate rotated the incoming log in between,
+so nothing is skipped and nothing is written twice. Two cases still start at
+the end of the incoming log, and the journal says so with a warning:
+
+- a run that was killed and never got to save (SIGKILL, the unit's memory
+  limit, power loss);
+- a stop long enough for the saved file to be rotated away twice.
+
+The parts on either side of the daemon behave differently when they restart:
+
+- **DO's forwarder** can't deliver while the sink's rsyslog is down. It keeps
+  what it couldn't send and delivers it, in order, once it reconnects. In
+  testing, every slow query arrived across ~20-second reboots, a 61-second
+  and a 15-minute rsyslog stop, and a 10-minute power-off, except one that
+  was in flight when rsyslog stopped (second point below). That was checked
+  against the database's own count of one of the test workload's
+  statements. DO documents neither of these two behaviours:
+  - **It can take a long time to reconnect after a long outage.** After the
+    61-second stop and the 10-minute power-off it was back within
+    30 seconds of rsyslog. After the 15-minute stop it took another
+    12 minutes, during which nothing arrived although the sink was up. The
+    whole backlog then arrived at once.
+  - **Messages in flight when rsyslog stops can be lost.** Syslog over TCP
+    has no acknowledgements, and DO's rsyslog sink type offers no
+    acknowledged mode. So whatever DO had sent that rsyslog hadn't yet read
+    is gone when rsyslog stops. Three of the five stops tested left a gap of
+    1.7–3 seconds in the forwarded stream, longer than any other in the
+    10 minutes around it. The 10-minute power-off lost one slow query out of
+    about 480. rsyslog is restarted by a sink reboot, `systemctl restart
+    rsyslog`, a `setup.sh` re-run and the certificate renewal hook.
+- **PMM's slowlog agent** (pmm-agent 3.10) adds up queries a minute at a time
+  and drops the minute in progress when it stops. When it starts, it reads
+  only what's written after it opens the slow log. (See
+  `agent/agents/mysql/slowlog/slowlog.go` and
+  `agent/utils/filereader/continuous_file_reader.go` in percona/pmm v3.10.0.)
+  So QAN can be short of up to about a minute of queries whenever pmm-agent
+  or its slowlog agent restarts: a sink reboot, `systemctl restart
+  pmm-agent`, or a `setup.sh` re-run, which re-registers the service. The
+  queries are all in `native_slow_query.log`; the sink can't change what PMM
+  does with them. On a test sink rebooted 49 seconds into a minute, QAN came
+  up 23 queries short, that minute's queries up to the reboot.
+- **The PMM Server** being down, for an upgrade or a reboot, costs little.
+  While pmm-agent can't reach it, pmm-agent keeps up to 100 one-minute QAN
+  reports in memory (`qanRequestsBufferSize` in
+  `agent/agents/supervisor/supervisor.go`, percona/pmm v3.10.0) and sends
+  them once it reconnects. Only a report that is being sent at the moment
+  the connection drops is discarded (`agent/client/client.go`). vmagent
+  buffers metrics too. After a ~40-second PMM Server reboot, QAN's
+  per-minute counts and the node metrics were complete for the whole
+  outage.
+
 ## Deployment model: one sink Droplet per endpoint, no HA
 
 "Single sink" means **one sink per DB endpoint**. Each endpoint DO lets you

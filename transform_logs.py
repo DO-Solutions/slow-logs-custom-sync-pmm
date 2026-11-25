@@ -3,7 +3,8 @@
 MySQL Slow Query Log Reconstruction Daemon
 Tails syslog-forwarded MySQL slow query logs from DigitalOcean Managed Databases,
 reconstructs multi-line blocks keyed by (source_host, block_id), and appends
-complete entries to the native slow query log for PMM QAN consumption.
+complete entries to the native slow query log for PMM QAN consumption. Saves
+its place on stop, so a restart picks up exactly where it left off.
 
 Deploys to: /var/log/mysql_sink/bin/transform_logs.py
 Managed by: slow-query-sink.service (systemd)
@@ -12,14 +13,24 @@ Managed by: slow-query-sink.service (systemd)
 import os
 import re
 import sys
+import json
 import time
 import signal
+import hashlib
 import logging
 
 COMBINED_FILE = "/var/log/mysql_sink/incoming/combined_mysql.log"
 SLOW_LOG_OUTPUT = "/var/log/mysql_sink/processed/native_slow_query.log"
 POLL_INTERVAL = 0.1   # seconds between reads when no new data
 BLOCK_TTL     = 30.0  # seconds before an incomplete block is discarded
+
+# Where the daemon saves its place in COMBINED_FILE (see "Saved position"
+# below). The directory is the unit's StateDirectory=: created by systemd,
+# owned by mysqlsink, 0700 because saved in-flight blocks hold SQL text.
+STATE_FILE        = "/var/lib/mysql_sink/slow-query-sink/position.json"
+STATE_VERSION     = 1
+MAX_STATE_BYTES   = 16 << 20  # bigger than this, in-flight blocks aren't saved
+FINGERPRINT_BYTES = 256       # bytes before the saved offset that must still match
 
 # Defense-in-depth bounds on untrusted syslog input (mTLS gates the sender, but
 # the parser still treats every line as hostile and refuses to grow unbounded).
@@ -254,24 +265,222 @@ def _purge_stale(blocks, block_times, active_block, out_file):
         _finalize_block(key, blocks, block_times, out_file, stale=True)
 
 
+# --- Saved position ---------------------------------------------------------
+#
+# Starting at the end of COMBINED_FILE, as this daemon used to on every start,
+# skips whatever rsyslog wrote while the daemon was down, and every block that
+# was mid-delivery when it stopped. (Seen on a test sink: an unattended upgrade
+# restarted rsyslog, the daemon restarted with it via Requires=, and about a
+# second of slow queries never reached QAN.)
+#
+# So whenever the daemon stops in a way it can clean up after (SIGTERM from
+# systemd, or an exception), it saves its place: the input file's inode, the
+# offset just past the last complete line it consumed, a hash of the bytes
+# before that offset (so a new file that reuses the inode number isn't taken
+# for the old one), and its in-flight blocks. The next start resumes exactly
+# there, so nothing is skipped and nothing is written twice.
+#
+# A run that's killed outright (SIGKILL, OOM, power loss) can't save. To keep
+# the next start from resuming a position this run has already moved past
+# (which would write those queries twice), the saved position is replaced by
+# a "running" marker as soon as it's been used. Finding the marker, a start
+# falls back to the end of the file, as before, and logs a warning saying so.
+
+
+def _fingerprint(fd, offset):
+    """Hash of the FINGERPRINT_BYTES before offset, or None if the file is
+    shorter than offset now. pread, so the file position is left alone."""
+    start = max(0, offset - FINGERPRINT_BYTES)
+    data = os.pread(fd, offset - start, start)
+    if len(data) != offset - start:
+        return None
+    return hashlib.sha256(data).hexdigest()
+
+
+def _write_state(data):
+    """Atomically replace STATE_FILE with data (a JSON string). Temp file,
+    fsync, rename: a crash mid-write leaves the previous file intact."""
+    os.makedirs(os.path.dirname(STATE_FILE), mode=0o700, exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, STATE_FILE)
+
+
+def _parse_state(state):
+    """Check a saved state and rebuild the parser's structures from it. The
+    file is the daemon's own, but a damaged one must cost a warning, not a
+    crash loop, so it's held to the same bounds as live input."""
+    def need(ok, what):
+        if not ok:
+            raise ValueError("bad " + what)
+
+    for k in ("ino", "offset"):
+        need(type(state[k]) is int and state[k] >= 0, k)
+    need(isinstance(state["fingerprint"], str), "fingerprint")
+    need(isinstance(state["skipping"], bool), "skipping")
+    entries = state["blocks"]
+    need(isinstance(entries, list) and len(entries) <= MAX_BLOCKS, "blocks")
+
+    now = time.monotonic()
+    blocks, block_times, active_block = {}, {}, {}
+    for host, block_id, age, lines in entries:
+        need(isinstance(host, str) and type(block_id) is int and isinstance(age, (int, float))
+             and isinstance(lines, dict) and len(lines) <= MAX_LINES_PER_BLOCK, "block")
+        key = (host, block_id)
+        blocks[key] = {}
+        for n, payload in lines.items():
+            need(isinstance(payload, str) and len(payload) <= MAX_PAYLOAD_BYTES, "payload")
+            blocks[key][int(n)] = payload
+        # Age, not a timestamp: monotonic time doesn't carry across a restart.
+        # Time spent stopped doesn't count towards BLOCK_TTL; the rest of the
+        # block is waiting in the file.
+        block_times[key] = now - max(0.0, age)
+    for host, block_id in state["active"]:
+        need((host, block_id) in blocks, "active block")
+        active_block[host] = (host, block_id)
+    return {"ino": state["ino"], "offset": state["offset"], "fingerprint": state["fingerprint"],
+            "skipping": state["skipping"], "blocks": blocks, "block_times": block_times,
+            "active_block": active_block}
+
+
+def _load_state():
+    """The position saved by the last clean stop, or None (reason logged) if
+    there's none to use: first start, a run killed before it could save, or a
+    damaged file."""
+    skipped = ("starting at the end of %s, so slow queries logged while the daemon "
+               "was stopped are skipped" % COMBINED_FILE)
+    try:
+        with open(STATE_FILE, "rb") as fh:
+            raw = fh.read(MAX_STATE_BYTES + 1)
+    except FileNotFoundError:
+        log.info("No saved position (first start); starting at the end of %s", COMBINED_FILE)
+        return None
+    except OSError as e:
+        log.warning("Can't read saved position %s (%s); %s", STATE_FILE, e, skipped)
+        return None
+    try:
+        if len(raw) > MAX_STATE_BYTES:
+            raise ValueError("larger than %d bytes" % MAX_STATE_BYTES)
+        state = json.loads(raw)
+        if state.get("version") != STATE_VERSION:
+            raise ValueError("unknown version %r" % (state.get("version"),))
+        if state.get("running"):
+            log.warning("The previous run stopped without saving its position (killed, or out "
+                        "of memory?); %s", skipped)
+            return None
+        return _parse_state(state)
+    except (ValueError, TypeError, KeyError, AttributeError) as e:
+        log.warning("Saved position %s is unusable (%s); %s", STATE_FILE, e, skipped)
+        return None
+
+
+def _open_input(saved):
+    """Open COMBINED_FILE where the last run stopped: in the file itself, or
+    in its .1 if logrotate rotated it meanwhile (run() then moves on to the
+    new file as it does after any rotation). Without a saved position, open it
+    at the end. Returns (file, inode, reader, blocks, block_times,
+    active_block); file is None if the daemon was told to stop while waiting
+    for the input to exist."""
+    if saved is not None:
+        for path in (COMBINED_FILE, COMBINED_FILE + ".1"):
+            try:
+                f = open(path, "rb")
+            except FileNotFoundError:
+                continue
+            ino = os.fstat(f.fileno()).st_ino
+            if ino == saved["ino"] and _fingerprint(f.fileno(), saved["offset"]) == saved["fingerprint"]:
+                f.seek(saved["offset"])
+                reader = _LineReader(f)
+                reader.skipping = saved["skipping"]
+                log.info("Resuming %s at byte %d with %d in-flight blocks",
+                         path, saved["offset"], len(saved["blocks"]))
+                return f, ino, reader, saved["blocks"], saved["block_times"], saved["active_block"]
+            f.close()
+        # Its in-flight blocks can't be finished now, so they're not restored:
+        # one that happens to look gap-free would be written truncated.
+        log.warning("The file the saved position is in is gone or has changed (rotated more "
+                    "than once while the daemon was stopped?); reading %s from its start, so "
+                    "slow queries logged in between are skipped", COMBINED_FILE)
+    f, ino = _open_tail(COMBINED_FILE)
+    if f is None:
+        return None, None, None, {}, {}, {}
+    if saved is not None:
+        f.seek(0)
+    return f, ino, _LineReader(f), {}, {}, {}
+
+
+def _mark_running():
+    """Replace the saved position with the "running" marker (see above), now
+    that it's been used."""
+    try:
+        _write_state(json.dumps({"version": STATE_VERSION, "running": True}))
+        return
+    except OSError as e:
+        log.warning("Can't write %s (%s); removing the used position instead", STATE_FILE, e)
+    try:
+        os.remove(STATE_FILE)  # still works when the disk is too full to write
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log.error("Can't remove the used position %s either (%s): if this run is killed, the "
+                  "next start writes everything since that position twice", STATE_FILE, e)
+
+
+def _save_state(f, reader, blocks, block_times, active_block):
+    """Save where this run stopped. Called on the way out of run(); doesn't raise."""
+    try:
+        # A fragment held back by the reader is re-read whole next time.
+        offset = f.tell() - len(reader.pending)
+        ino = os.fstat(f.fileno()).st_ino
+        now = time.monotonic()
+        state = {
+            "version": STATE_VERSION, "ino": ino, "offset": offset,
+            "fingerprint": _fingerprint(f.fileno(), offset), "skipping": reader.skipping,
+            "blocks": [[host, block_id, now - block_times.get((host, block_id), now),
+                        {str(n): p for n, p in lines.items()}]
+                       for (host, block_id), lines in blocks.items()],
+            "active": [list(key) for key in active_block.values()],
+        }
+        data = json.dumps(state)
+        if len(data) > MAX_STATE_BYTES:
+            log.warning("%d in-flight blocks are too large to save; they're lost", len(blocks))
+            state["blocks"], state["active"] = [], []
+            data = json.dumps(state)
+        _write_state(data)
+    except (OSError, ValueError) as e:
+        log.error("Couldn't save position to %s (%s); the next start begins at the end of %s, "
+                  "skipping whatever is logged until then", STATE_FILE, e, COMBINED_FILE)
+        return
+    log.info("Saved position: byte %d of %s, %d in-flight blocks", offset, f.name, len(blocks))
+
+
 def run():
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
     os.makedirs(os.path.dirname(SLOW_LOG_OUTPUT), exist_ok=True)
 
-    blocks       = {}  # (host, block_id) -> {line_num: payload}
-    block_times  = {}  # (host, block_id) -> monotonic timestamp of first line seen
-    active_block = {}  # host -> the (host, block_id) key currently being written
-
     log.info("Starting slow query log daemon, tailing %s", COMBINED_FILE)
 
-    f, current_inode = _open_tail(COMBINED_FILE)
+    # blocks:       (host, block_id) -> {line_num: payload}
+    # block_times:  (host, block_id) -> monotonic timestamp of first line seen
+    # active_block: host -> the (host, block_id) key currently being written
+    f, current_inode, reader, blocks, block_times, active_block = _open_input(_load_state())
     if f is None:
         return
-    reader = _LineReader(f)
 
-    out_file, out_inode = _open_output(SLOW_LOG_OUTPUT)
+    try:
+        out_file, out_inode = _open_output(SLOW_LOG_OUTPUT)
+    except BaseException:
+        f.close()
+        raise
+    # Only now, so a start that fails to open the output keeps the saved
+    # position for the next attempt.
+    _mark_running()
     try:
         while _running:
             line = reader.readline()
@@ -287,10 +496,14 @@ def run():
                     # corrupt both.
                     if reader.pending:
                         _warn_drop("incomplete line at input rotation")
-                    f.close()
-                    f, current_inode = _open_tail(COMBINED_FILE)
-                    if f is None:
+                    # Keep the old file until the new one is open: stopped
+                    # while waiting for it, the position saved is the old
+                    # file's end, and the next start carries on from there.
+                    new_f, new_inode = _open_tail(COMBINED_FILE)
+                    if new_f is None:
                         break
+                    f.close()
+                    f, current_inode = new_f, new_inode
                     f.seek(0)
                     reader = _LineReader(f)
                     continue
@@ -299,13 +512,12 @@ def run():
                 _purge_stale(blocks, block_times, active_block, out_file)
                 time.sleep(POLL_INTERVAL)
     finally:
-        # In-flight blocks are deliberately NOT flushed on stop: one that's
-        # mid-delivery can look gap-free (lines 1..k of N) and would be written
-        # truncated. Losing at most the last few seconds' worth across a restart
-        # is the safer trade.
+        # In-flight blocks are saved, not flushed: one that's mid-delivery can
+        # look gap-free (lines 1..k of N) and would be written truncated. The
+        # next start restores them and reads the rest of their lines.
         out_file.close()
-        if f:
-            f.close()
+        _save_state(f, reader, blocks, block_times, active_block)
+        f.close()
     log.info("Daemon stopped")
 
 

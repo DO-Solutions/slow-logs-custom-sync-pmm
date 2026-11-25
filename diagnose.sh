@@ -209,6 +209,17 @@ if systemctl is-active --quiet slow-query-sink 2>/dev/null; then
       fail "daemon is writing to '$WRITING_TO', not $PROCESSED_FILE — it missed a log rotation (pre-fix transform_logs.py), so QAN sees no new data. Fix: git pull && bash setup.sh (or at least: systemctl restart slow-query-sink)"
     fi
   fi
+  # The daemon saves its place in the incoming log here when it stops, so a
+  # restart doesn't skip slow queries. systemd creates it from the unit's
+  # StateDirectory=, so it's missing if the installed unit predates that.
+  STATE_DIR=/var/lib/mysql_sink/slow-query-sink
+  if [ ! -d "$STATE_DIR" ]; then
+    warn "$STATE_DIR doesn't exist, so the daemon can't save its position and a restart skips what arrives while it's down. The installed unit is probably older than transform_logs.py. Fix: git pull && bash setup.sh"
+  elif [ "$(stat -c '%U %a' "$STATE_DIR")" != "mysqlsink 700" ]; then
+    warn "$STATE_DIR is $(stat -c '%U mode %a' "$STATE_DIR"), expected mysqlsink mode 700 (it holds SQL text from in-flight queries). Fix: git pull && bash setup.sh"
+  else
+    pass "daemon can save its position across restarts ($STATE_DIR)"
+  fi
 else
   fail "slow-query-sink.service is NOT active — systemctl status slow-query-sink ; journalctl -u slow-query-sink -n 50"
 fi

@@ -28,7 +28,7 @@ QAN ingestion has a separate polling interval — see Step 6 and Troubleshooting
 
 | What | Notes |
 |------|-------|
-| **PMM Server Droplet** | **Ubuntu 22.04, 24.04 or 26.04 LTS** — see "Supported OS versions" below. Minimum 4 GB RAM (8 GB recommended). Must be provisioned and reachable before running `setup.sh`. Note DigitalOcean offers [a prebuilt Marketplace Droplet to make this deployment easier](https://marketplace.digitalocean.com/apps/percona-monitoring-and-management) |
+| **PMM Server Droplet** | **Ubuntu 22.04, 24.04 or 26.04 LTS** — see "Supported OS versions" below. Minimum 4 GB RAM (8 GB recommended). Must be provisioned and reachable before running `setup.sh`. On PMM 3.10.0 and earlier, restrict its port 443 and make sure HTTP/2 is on (Step 1, "Restrict port 443, and make sure HTTP/2 is on"). Note DigitalOcean offers [a prebuilt Marketplace Droplet to make this deployment easier](https://marketplace.digitalocean.com/apps/percona-monitoring-and-management) |
 | **Sink Droplet** | **Ubuntu 22.04, 24.04 or 26.04 LTS** — see "Supported OS versions" below. Any size (required size based on database query load; can upscale the Droplet later if initial size guess is too small or weak). This is where `setup.sh` runs. |
 | **DNS hostname for the sink** | A public DNS **A record** pointing at the sink Droplet's IP (e.g. `logs.example.com → <SINK_IP>`). Required — the sink presents a Let's Encrypt cert for this name, and certbot's HTTP-01 challenge needs it to resolve here. No domain handy? `<IP-dashed>.sslip.io` works for testing. |
 | **DO Managed MySQL** | Slow query log must be enabled in the DO control panel (Database → Settings → Slow query log). |
@@ -93,6 +93,65 @@ touching the others (see "Monitoring multiple Managed MySQL endpoints" below).
   Once you've changed the admin password via the UI, the automatic path no
   longer works (the default credentials are gone) — you must generate the
   token manually from then on.
+
+### Restrict port 443, and make sure HTTP/2 is on (PMM 3.10.0 and earlier)
+
+PMM Server 3.10.0 and earlier bundle an nginx affected by
+[CVE-2026-123007](https://access.redhat.com/security/cve/cve-2026-123007), a
+remote-code-execution flaw in nginx's HTTP/2 handling. Percona's fix is PMM
+3.11.0, which hadn't been released as of 25 November 2026; upgrade to it once
+it's out. Until then, do both of these:
+
+1. **Allow port 443 only from your sinks and your own addresses.** Use a
+   DigitalOcean Cloud Firewall on the PMM Server Droplet rather than `ufw`:
+   PMM runs in Docker, and Docker's published ports bypass `ufw`. Allow:
+   - TCP 443 from the sink Droplets. The easiest way is a tag: tag every sink
+     Droplet (e.g. `pmm-sink`) and use the tag as the source.
+   - TCP 443 (web UI) and 22 (SSH) from the addresses you administer PMM from.
+   - Nothing else inbound; leave outbound open. In testing, the sinks needed
+     no other inbound rule: their agents connect to the server, not the other
+     way round.
+
+   With `doctl` (replace the placeholders; the tag must already exist):
+   ```bash
+   doctl compute firewall create --name pmm-server-fw \
+     --droplet-ids <PMM_DROPLET_ID> \
+     --inbound-rules "protocol:tcp,ports:443,tag:pmm-sink protocol:tcp,ports:443,address:<ADMIN_IP>/32 protocol:tcp,ports:22,address:<ADMIN_IP>/32" \
+     --outbound-rules "protocol:tcp,ports:all,address:0.0.0.0/0,address:::/0 protocol:udp,ports:all,address:0.0.0.0/0,address:::/0 protocol:icmp,address:0.0.0.0/0,address:::/0"
+   ```
+
+2. **Turn HTTP/2 back on if it's off.** pmm-agent connects to the PMM Server
+   over gRPC, which needs HTTP/2. The DigitalOcean Marketplace PMM image
+   (builds from 18 November 2026 on) turns HTTP/2 off on first boot to
+   mitigate the CVE, and with it off no pmm-agent can connect: `setup.sh`
+   fails at `pmm-admin add mysql` with "pmm-agent is not connected to PMM
+   Server", and `journalctl -u pmm-agent` on the sink shows `tls: no
+   application protocol`. Check from a machine step 1 allows:
+   ```bash
+   echo | openssl s_client -alpn h2,http/1.1 -connect <PMM_SERVER_IP>:443 2>/dev/null | grep 'ALPN protocol'
+   ```
+   `ALPN protocol: h2` means it's on; `ALPN protocol: http/1.1` means it's
+   off. To turn it back on — only once step 1 is in place — run this on the
+   PMM Server Droplet, then check again:
+   ```bash
+   # Marketplace image only: stop its boot-time unit turning HTTP/2 off again
+   systemctl disable pmm-mitigate-nginx2root.service
+   docker exec pmm-server sh -c 'grep -q "^ *http2 on;" /etc/nginx/conf.d/pmm.conf || sed -i "/^ *listen 8443 ssl;/a\    http2 on;" /etc/nginx/conf.d/pmm.conf'
+   docker exec pmm-server nginx -t
+   docker exec pmm-server supervisorctl restart nginx
+   ```
+   - The Marketplace image turns HTTP/2 off at every boot, with
+     `pmm-mitigate-nginx2root.service`, so disabling that unit is what makes
+     the change last. If `systemctl` says the unit doesn't exist, this server
+     doesn't have it; run the other three lines. To undo, `systemctl enable`
+     the unit and reboot.
+   - The `docker exec` lines restore the `http2 on;` line PMM's own image
+     ships with, and are safe to run again. `nginx -t` may warn that
+     `ssl_stapling` is ignored; that's PMM's self-signed certificate, and
+     harmless.
+   - In testing, the change survived reboots once the unit was disabled. It
+     doesn't survive a re-created container, so check again after upgrading
+     PMM.
 
 ---
 
@@ -646,7 +705,8 @@ applies, rather than you needing to guess from the symptom alone.
 | "The previous run stopped without saving its position" in daemon logs | The daemon was killed rather than stopped, so it couldn't save its place in `combined_mysql.log`. Causes: `kill -9`, the unit's `MemoryMax=256M` (look for `oom` in `journalctl -u slow-query-sink` and `dmesg`), or a hard power-off. It started at the end of the file, so slow queries that arrived while it was down are missing from QAN. Once is harmless; if it keeps happening, find what is killing it |
 | "The file the saved position is in is gone or has changed" in daemon logs | The daemon was stopped long enough for logrotate to rotate `combined_mysql.log` twice (more than a day), or the file was replaced. The daemon read the current file from the start, so slow queries in the rotated-away file are missing from QAN |
 | "Couldn't save position" or "Can't write …/position.json" in daemon logs | The daemon can't write its state directory, `/var/lib/mysql_sink/slow-query-sink`. systemd creates it from the unit's `StateDirectory=`, owned by `mysqlsink` with mode `700`. Check the disk isn't full (`df -h /var/lib`) and that the unit file is current (`git pull && bash setup.sh`). Until it's fixed, a restart skips what arrives while the daemon is down |
-| `diagnose.sh` warns about rsyslog TLS errors such as `http request`, `Handshake failed`, or a remote like `*.shodan.io` | Port 6514 is open to the internet, so scanners connect to it; mutual TLS rejects them and rsyslog logs the failed handshake. That's harmless noise when stage 7 shows data arriving. A handshake failure from DO itself shows up as no data arriving at all (see the `combined_mysql.log` row above) |
+| `diagnose.sh` warns about rsyslog TLS errors such as `http request`, `Handshake failed`, or a remote like `*.shodan.io` | Port 6514 is open to the internet, so scanners connect to it; mutual TLS rejects them and rsyslog logs the failed handshake. That's harmless noise when stage 7 shows data arriving. A handshake failure from DO itself shows up as no data arriving at all (see the `combined_mysql.log` row above, and the `certificate verify failed` row below) |
+| Nothing reaches `combined_mysql.log`, and `journalctl -u rsyslog` (or `diagnose.sh` stage 5) keeps showing `certificate verify failed`, with `Certificate error … issuer = /CN=mysql-sink-ca subject = /CN=do-logforward-client err 20:unable to get local issuer certificate` | That's DO's forwarder, not a scanner (`CN=do-logforward-client` is the client certificate `gen-certs.sh` makes), presenting a client certificate this sink's CA (`certs/ca.pem`) didn't sign. Most likely, DO's Log Forwarding destination doesn't have this sink's current client certificate and key: they were pasted from another sink, or `gen-certs.sh` was re-run after pasting them (each run makes a new CA). Fix: paste both again from this sink (`cat certs/do-client-cert.pem`, `cat certs/do-client-key.pem`) into the destination and save (Step 4). Less likely: the database has another rsyslog destination with its own client certificate (an old sink, or another log tool). In testing, DO once sent a newly added destination the other destination's client certificate, for at least 6 minutes; two later new destinations got their own within 30 seconds, and the existing destination was never affected. If pasting again doesn't help, delete the destination in DO and add it again. It's fixed when the error stops and `ss -tn state established '( sport = :6514 )'` shows DO's connection |
 | QAN worked for about a day, then stopped; `native_slow_query.log` is empty or tiny while `native_slow_query.log.1` keeps growing | Old `transform_logs.py`: it never reopened its output after logrotate's daily rotation, so it kept writing to the rotated file while PMM read the new, empty one. `diagnose.sh` stage 8 reports "daemon is writing to '…log.1'". Fix: `git pull && bash setup.sh` (it restarts the daemon on the new code) |
 | QAN stopped; the `slow_query_log_file` symlink is gone but `<that path>.old` exists; `journalctl -u pmm-agent` repeats `Failed to stat … no such file or directory` while `pmm-admin list` still shows `mysql_slowlog_agent Running` | PMM's own slow-log rotation fired (default limit 1 GiB): it renames the slow-log path to `.old` and expects `mysqld` to recreate it, which can't happen here. Fix: `git pull && bash setup.sh` — it recreates the symlink, removes the stale `.old`, and sets the service's PMM-side rotation limit to 0 (disabled). `diagnose.sh` and `verify-slow-log.sh` both detect this state |
 | QAN stopped right after a DB failover, maintenance or resize; `pmm-admin list` shows the slowlog agent `Waiting`; `verify-slow-log.sh` says the `slow_query_log_file` path doesn't exist | Expected for up to ~1 minute. DO's `slow_query_log_file` embeds the serving node's hostname (`…/<cluster>-<n>-slow.log`), and a failover — or a resize, which replaces nodes — moves the primary to a node with a different `<n>` (observed: `-1` → `-4`). `mysql-sink-reconcile.timer` notices within a minute and adds the symlink at the new path; the slowlog agent resumes by itself. If it doesn't: `systemctl status mysql-sink-reconcile.timer` and `journalctl -u mysql-sink-reconcile -n 20`; on sinks set up before the timer existed, `git pull && bash setup.sh` installs it (and fixes the path right away) |
@@ -654,12 +714,14 @@ applies, rather than you needing to guess from the symptom alone.
 | `test_prepared_statements.py` fails with `AttributeError: module 'ssl' has no attribute 'wrap_socket'` | You're using Ubuntu 24.04's apt `python3-mysql.connector` (8.0.15), which doesn't work on Python 3.12. Use the venv from Step 6 instead |
 | `mysql_probe`/`setup.sh` preflight fails with `ERROR 1045 Access denied` | Networking is fine (you got a real MySQL auth response, not a timeout) — this is a credentials issue. Check `DB_PASS` in `.env` matches the current `pmm_monitor` password exactly; if `.env` was ever edited on Windows, check for a stray trailing `\r` (`cat -A .env \| grep DB_PASS` — a `^M` before the line end means CRLF snuck in and is silently corrupting the password when bash sources it: fix with `sed -i 's/\r$//' .env`). Also confirm `pmm_monitor` actually exists on *this* DB cluster, not a previous one. |
 | PMM agents not Running | `journalctl -u pmm-agent -n 50`; verify `PMM_TOKEN` is valid; check PMM server is reachable on port 443 |
+| `setup.sh` prints `Registered.`, then stops at `pmm-admin add mysql` with "pmm-agent is not connected to PMM Server"; `journalctl -u pmm-agent` repeats `tls: no application protocol` | The PMM Server has HTTP/2 turned off, and pmm-agent can't connect without it (gRPC). The DigitalOcean Marketplace PMM image does this on first boot (builds from 18 November 2026 on). Follow Step 1, "Restrict port 443, and make sure HTTP/2 is on", then re-run `bash setup.sh`: it keeps the registration it made and finishes |
 | QAN shows no data | First check whether it's just lagging: `grep` the query text in `/var/log/mysql_sink/processed/native_slow_query.log` — if it's there, QAN's own ingestion has a polling delay on top of the sink's real-time write, give it a minute or two. If it's genuinely absent: run `bash verify-slow-log.sh` — it checks both the symlink path AND that the target file actually exists (`readlink -f` alone will resolve a path even if nothing exists there, which reads as "correct" when it isn't); confirm `mysql_slowlog_agent` is Running in `pmm-admin list` |
 | `socat-mysql-proxy` fails to start | Check `DB_HOST` and `DB_PORT` in `/etc/systemd/system/socat-mysql-proxy.service`; test connectivity: `nc -zv <DB_HOST> 25060` |
 | `setup.sh`'s DB preflight/probe fails outright (no connection), or `verify-slow-log.sh` errors | Read the printed checklist (from `mysql_probe` in `common.sh`) — most common cause is the sink Droplet not being in the DB cluster's **Trusted Sources** (Databases → cluster → Settings → Trusted Sources); DO drops the connection with no error visible on this end. Also check the socat proxy (`systemctl status socat-mysql-proxy`), credentials in `.env`, and that the CA cert matches this exact cluster. `bash verify-slow-log.sh --direct` bypasses the proxy to isolate proxy vs. DB/firewall |
 | `mysql: command not found` (from `common.sh`'s `mysql_probe`, right at the start of `setup.sh`) | Expected to self-heal: `mysql_probe` auto-installs `default-mysql-client` via `apt-get` the first time it's needed, since a fresh Droplet doesn't ship a MySQL client and the preflight check runs before `setup.sh`'s own package-install step. If you still see this, either you're on an old copy of `common.sh` (`git pull` and re-run), you're not running as root (apt-get install needs root), or the Droplet has no working internet/apt access — install it yourself with `apt-get install -y default-mysql-client` and re-run |
-| `setup.sh` stops with "a PMM node named '…' already exists and is NOT this machine's" | Another machine (usually another sink with the same hostname) is registered under this node name. Registering would run `pmm-admin config --force`, which removes that node with all its services and agents — so `setup.sh` refuses. Set a unique `PMM_NODE_NAME` in `.env`; or, if that node is stale (its Droplet was deleted), re-run with `PMM_FORCE_REREGISTER=1` |
-| `setup.sh` stops with "PMM service name '…' is already used by another node" | PMM service names are unique per PMM Server and another sink already uses this one (often both are on the default `do-managed-mysql`). Set a unique `PMM_SERVICE_NAME` in `.env` — see "Monitoring multiple Managed MySQL endpoints with one PMM Server" |
+| `setup.sh` stops with "a PMM node named '…' already exists and is NOT this machine's" | Another machine is registered under this node name: usually another sink with the same hostname, or the sink this Droplet replaces. Registering would run `pmm-admin config --force`, which removes that node with all its services and agents — so `setup.sh` refuses. The message shows the node's address and whether its pmm-agent is connected. If it's another running sink, set a unique `PMM_NODE_NAME` in `.env`. If its Droplet was deleted, re-run with `PMM_FORCE_REREGISTER=1 bash setup.sh`; PMM can keep showing a deleted Droplet's agent as connected for several minutes (over 4 in testing), so check that no Droplet still has that address. Or remove the old node first (`destruct.sh` on its Droplet, or PMM's Inventory). The message ends with what the run already did: at most a token saved in `.env`, which the next run reuses, and the MySQL client |
+| `setup.sh` stops with "couldn't check whether a PMM node named '…' belongs to another machine" | The PMM API lookup failed; its error is printed just above. Check `PMM_SERVER` (`curl -sk -o /dev/null -w '%{http_code}\n' https://<PMM_SERVER>/v1/server/readyz` should print `200`) and that `PMM_TOKEN` is a current Admin service-account token (HTTP 401/403 means it isn't), then re-run |
+| `setup.sh` stops with "PMM service name '…' is already used by another node" | PMM service names are unique per PMM Server and another sink already uses this one (often both are on the default `do-managed-mysql`); the message names the node. Set a unique `PMM_SERVICE_NAME` in `.env` — see "Monitoring multiple Managed MySQL endpoints with one PMM Server". If it's this endpoint's own service, left by a sink that no longer exists, delete it (or its node) in PMM's Inventory and re-run |
 | Node + agents exist in PMM but no service | `setup.sh` registers the service last; if it exited earlier (e.g. the DB preflight/probe failed), the node/agents from `pmm-admin config` are left orphaned. Fix the earlier failure and re-run `setup.sh` — it's idempotent and will pick up from where it left off. To fully reset first, use `destruct.sh` above |
 | rsyslog silent failure (action suspended/resumed loop) | `/var/log/mysql_sink` and `/var/log/mysql_sink/incoming` must be owned `syslog:adm` (mode `750`, as `setup.sh` sets them) — root ownership breaks rsyslog writes. Re-run `setup.sh` to restore ownership |
 

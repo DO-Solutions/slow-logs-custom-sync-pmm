@@ -39,6 +39,10 @@ Full design rationale and pipeline diagram: [docs/architecture.md](docs/architec
    ```bash
    curl -fsSL https://www.percona.com/get/pmm | bash
    ```
+   On PMM 3.10.0 and earlier, restrict its port 443 to your sinks, and make
+   sure HTTP/2 is on (the DigitalOcean Marketplace image turns it off, and
+   pmm-agent can't connect without it). See RUNBOOK Step 1, "Restrict port
+   443, and make sure HTTP/2 is on".
 2. **Provision the sink Droplet, SSH in, and clone this repo there**:
    ```bash
    ssh root@<SINK_IP>

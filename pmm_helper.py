@@ -68,9 +68,10 @@ def local_status(status):
             "true" if s.get("connected") else "false")
 
 
-def service_owner(services_resp, name, local_node_id):
+def service_owner(services_resp, name, local_node_id, nodes_resp=None):
     """Where is a service named `name` registered on the PMM Server?
     services_resp: GET /v1/inventory/services -> {"mysql": [...], "postgresql": [...], ...}
+    nodes_resp (optional): GET /v1/inventory/nodes, only to name the other node.
     Returns ("absent"|"here"|"elsewhere", [details for "elsewhere"])."""
     matches = [s for ss in services_resp.values() if isinstance(ss, list)
                for s in ss if s.get("service_name") == name]
@@ -78,9 +79,36 @@ def service_owner(services_resp, name, local_node_id):
         return "absent", []
     if local_node_id and all(s.get("node_id") == local_node_id for s in matches):
         return "here", []
+    node_names = {n.get("node_id"): n.get("node_name") for ns in (nodes_resp or {}).values()
+                  if isinstance(ns, list) for n in ns}
     return "elsewhere", [{"service_id": s.get("service_id"), "node_id": s.get("node_id"),
+                          "node_name": node_names.get(s.get("node_id")),
                           "address": s.get("address"), "port": s.get("port")}
                          for s in matches if s.get("node_id") != local_node_id]
+
+
+# setup.sh prints these when it refuses to register, so they're for a person
+# reading an error, not for parsing: one line per conflicting node or service.
+
+def describe_nodes(name, details):
+    lines = []
+    for d in details:
+        agents = d.get("pmm_agents") or []
+        if not agents:
+            state = "no pmm-agent runs on it (left over from a deleted Droplet or an unfinished setup)"
+        else:
+            state = "; ".join(f"pmm-agent {a.get('agent_id')} is "
+                              + ("shown as connected" if a.get("connected") else "not connected")
+                              for a in agents)
+        lines.append(f"node '{name}' (ID {d.get('node_id')}, address {d.get('address')}): {state}")
+    return "\n".join(lines)
+
+
+def describe_services(name, details):
+    return "\n".join(
+        f"service '{name}' (ID {d.get('service_id')}) on node "
+        + (f"'{d['node_name']}' (ID {d.get('node_id')})" if d.get("node_name") else f"ID {d.get('node_id')}")
+        for d in details)
 
 
 # ---------------------------------------------------------------------------
@@ -136,8 +164,8 @@ def _api(method, path, auth_header, body=None):
 
 
 def cmd_node_owner(name, local_agent_id):
-    """Exit 0 = absent, 1 = ours, 2 = someone else's (details on stdout as
-    JSON), 3 = couldn't ask the PMM API (message on stderr)."""
+    """Exit 0 = absent, 1 = ours, 2 = someone else's (a description on
+    stdout, see describe_nodes), 3 = couldn't ask the PMM API (message on stderr)."""
     auth = "Bearer " + os.environ.get("PMM_TOKEN", "")
     try:
         nodes = _api("GET", "/v1/inventory/nodes", auth)
@@ -152,13 +180,14 @@ def cmd_node_owner(name, local_agent_id):
         return 3
     verdict, details = node_owner(nodes, agents, name, local_agent_id)
     if verdict == "other":
-        print(json.dumps(details))
+        print(describe_nodes(name, details))
     return {"absent": 0, "ours": 1, "other": 2}[verdict]
 
 
 def cmd_service_owner(name, local_node_id):
     """Exit 0 = no such service, 1 = registered on local_node_id, 2 = registered
-    on some other node (details on stdout as JSON), 3 = API error."""
+    on some other node (a description on stdout, see describe_services),
+    3 = API error."""
     auth = "Bearer " + os.environ.get("PMM_TOKEN", "")
     try:
         services = _api("GET", "/v1/inventory/services", auth)
@@ -172,7 +201,13 @@ def cmd_service_owner(name, local_node_id):
         return 3
     verdict, details = service_owner(services, name, local_node_id)
     if verdict == "elsewhere":
-        print(json.dumps(details))
+        # Only to name the other node in the message; the verdict doesn't depend on it.
+        try:
+            verdict, details = service_owner(services, name, local_node_id,
+                                             _api("GET", "/v1/inventory/nodes", auth))
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+        print(describe_services(name, details))
     return {"absent": 0, "here": 1, "elsewhere": 2}[verdict]
 
 
@@ -188,6 +223,9 @@ def cmd_mint_token(sa_name):
         sa = next((s for s in found if s.get("name") == sa_name), None)
         if sa is None:
             sa = _api("POST", base, auth, {"name": sa_name, "role": "Admin"})
+            print(f"  Created service account '{sa_name}' (role Admin).", file=sys.stderr)
+        else:
+            print(f"  Service account '{sa_name}' already exists — adding a new token to it.", file=sys.stderr)
         tok = _api("POST", f"{base}/{sa['id']}/tokens", auth,
                    {"name": f"{sa_name}-{os.urandom(3).hex()}"})
         key = tok["key"]

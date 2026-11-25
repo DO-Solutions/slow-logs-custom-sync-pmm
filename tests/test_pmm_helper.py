@@ -117,6 +117,38 @@ class ServiceOwnerTests(unittest.TestCase):
     def test_unknown_local_node_means_elsewhere(self):
         self.assertEqual(ph.service_owner(SERVICES, "prod-primary", "")[0], "elsewhere")
 
+    def test_other_node_is_named_when_nodes_are_given(self):
+        _, details = ph.service_owner(SERVICES, "prod-replica", "node-a", NODES)
+        self.assertEqual(details[0]["node_name"], "sink-b")
+        _, details = ph.service_owner(SERVICES, "prod-replica", "node-a")
+        self.assertIsNone(details[0]["node_name"])
+
+
+class DescribeTests(unittest.TestCase):
+    """The text setup.sh prints when it refuses to register."""
+
+    def test_node_with_connected_agent(self):
+        _, details = ph.node_owner(NODES, AGENTS, "sink-b", "pa-1")
+        self.assertEqual(ph.describe_nodes("sink-b", details),
+                         "node 'sink-b' (ID node-b, address 203.0.113.11): pmm-agent pa-2 is shown as connected")
+
+    def test_orphan_node_says_no_agent(self):
+        _, details = ph.node_owner(NODES, AGENTS, "sink-old", "pa-1")
+        self.assertIn("no pmm-agent runs on it", ph.describe_nodes("sink-old", details))
+
+    def test_disconnected_agent(self):
+        agents = {"pmm_agent": [{"agent_id": "pa-2", "runs_on_node_id": "node-b", "connected": False}]}
+        _, details = ph.node_owner(NODES, agents, "sink-b", "pa-1")
+        self.assertTrue(ph.describe_nodes("sink-b", details).endswith("pmm-agent pa-2 is not connected"))
+
+    def test_service_names_its_node_when_known(self):
+        _, details = ph.service_owner(SERVICES, "prod-replica", "node-a", NODES)
+        self.assertEqual(ph.describe_services("prod-replica", details),
+                         "service 'prod-replica' (ID svc-9) on node 'sink-b' (ID node-b)")
+        _, details = ph.service_owner(SERVICES, "prod-replica", "node-a")
+        self.assertEqual(ph.describe_services("prod-replica", details),
+                         "service 'prod-replica' (ID svc-9) on node ID node-b")
+
 
 class CliTests(unittest.TestCase):
     def run_cli(self, argv, stdin_obj):

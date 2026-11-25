@@ -15,9 +15,46 @@ SCRIPT_DIR_LOCAL="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR_LOCAL/common.sh"
 
+# What this run has changed so far. Only a few small steps run before the
+# preflight checks that can stop setup.sh (DB access, PMM identity), and the
+# stop messages tell the user to fix something and re-run — so they say
+# exactly which of these steps already happened (report_changes_so_far).
+CHANGED_ENV_MODE=0
+MINTED_TOKEN=0
+HAD_MYSQL_CLIENT=0; command -v mysql >/dev/null 2>&1 && HAD_MYSQL_CLIENT=1
+
+report_changes_so_far() {
+  local any=0
+  echo "What this run has already done:"
+  if [ "$MINTED_TOKEN" -eq 1 ]; then
+    any=1
+    echo "  - On the PMM Server: added a token to service account '${SA_NAME}' (see above"
+    echo "    for whether the account was created or already existed), and saved it in"
+    echo "    .env as PMM_TOKEN. Re-running uses that token; it doesn't mint another."
+  fi
+  if [ "$HAD_MYSQL_CLIENT" -eq 0 ] && command -v mysql >/dev/null 2>&1; then
+    any=1
+    echo "  - On this Droplet: installed the MySQL client (default-mysql-client), used"
+    echo "    to check the DB."
+  fi
+  if [ "$CHANGED_ENV_MODE" -eq 1 ]; then
+    any=1
+    echo "  - Made .env readable by its owner only (mode 600), since it holds secrets."
+  fi
+  if [ "$any" -eq 0 ]; then
+    echo "  Nothing: no change on this Droplet or the PMM Server."
+  else
+    echo "  Nothing else: it hasn't installed or changed anything for the sink yet, and"
+    echo "  hasn't registered or changed any node, service or agent on the PMM Server."
+  fi
+}
+
 # .env holds DB_PASS and PMM_TOKEN — keep it owner-only regardless of how it
 # was created (an editor or `cat >` leaves it at the umask default, 0644).
-[ -f "$SCRIPT_DIR_LOCAL/.env" ] && chmod 600 "$SCRIPT_DIR_LOCAL/.env"
+if [ -f "$SCRIPT_DIR_LOCAL/.env" ] && [ "$(stat -c %a "$SCRIPT_DIR_LOCAL/.env")" != "600" ]; then
+  chmod 600 "$SCRIPT_DIR_LOCAL/.env"
+  CHANGED_ENV_MODE=1
+fi
 # Sources .env and applies defaults for every optional key (common.sh).
 load_config "$SCRIPT_DIR_LOCAL"
 
@@ -86,7 +123,8 @@ echo "==> Preflight: verifying direct DB connectivity before making any changes"
 if ! mysql_probe "$PMM_MONITOR_USER" "$DB_PASS" "$DB_HOST" "$DB_PORT" "$DO_CA_SRC" "SELECT 1;" >/dev/null; then
   echo "" >&2
   echo "ERROR: setup.sh cannot reach/authenticate to the Managed MySQL DB directly at ${DB_HOST}:${DB_PORT}." >&2
-  echo "Nothing has been changed on this droplet yet — fix connectivity/credentials and re-run." >&2
+  echo "Fix connectivity/credentials (see above) and re-run." >&2
+  report_changes_so_far >&2
   exit 1
 fi
 echo "  DB reachable, credentials verified (direct, pre-socat)."
@@ -145,6 +183,7 @@ INSTR
     END { if (!done) print "PMM_TOKEN=" t }
   ' "$ENV_FILE" > "$ENV_TMP"
   mv "$ENV_TMP" "$ENV_FILE"
+  MINTED_TOKEN=1
 fi
 
 echo "==> Preflight: PMM identity (node '${PMM_NODE_NAME}', service '${PMM_SERVICE_NAME}')"
@@ -152,7 +191,8 @@ echo "==> Preflight: PMM identity (node '${PMM_NODE_NAME}', service '${PMM_SERVI
 # its services and agents — so before registering, make sure a node by that
 # name isn't some other machine's (e.g. a second sink with the same hostname),
 # and that the service name isn't already taken by another node. Both are
-# read-only API lookups; nothing has been changed on the PMM Server yet.
+# read-only API lookups; nothing has been registered on the PMM Server yet
+# (at most a token was minted above), and report_changes_so_far says so.
 read -r LOCAL_AGENT_ID LOCAL_NODE_ID LOCAL_NODE_NAME LOCAL_SERVER LOCAL_CONNECTED < <(pmm_local_status)
 # pmm-admin can't report the agent ID while pmm-agent is stopped; its config
 # file still has it, and that's what the ownership check needs.
@@ -175,19 +215,34 @@ else
     1) echo "  Node '${PMM_NODE_NAME}' exists and belongs to this machine — re-registering it." ;;
     2)
       if [ "$PMM_FORCE_REREGISTER" = "1" ]; then
-        echo "WARNING: node '${PMM_NODE_NAME}' belongs to a different pmm-agent (${OWNER_DETAILS});" >&2
+        echo "WARNING: node '${PMM_NODE_NAME}' belongs to a different pmm-agent:" >&2
+        printf '%s\n' "$OWNER_DETAILS" | sed 's/^/  /' >&2
         echo "  PMM_FORCE_REREGISTER=1, so it will be REPLACED — with all its services and agents." >&2
       else
+        # No backticks in these messages: the here-documents expand them.
         cat >&2 <<MSG
 ERROR: a PMM node named '${PMM_NODE_NAME}' already exists and is NOT this machine's:
-  ${OWNER_DETAILS}
-Registering would remove it, with all of its services and agents (pmm-admin
-config --force). Usually this means another sink has the same hostname.
-  - Give this sink its own name: set PMM_NODE_NAME=<unique name> in .env, or
-  - if that node really is stale (e.g. its Droplet was deleted), re-run with
-    PMM_FORCE_REREGISTER=1 to replace it.
-Nothing has been changed on this Droplet or the PMM Server.
+$(printf '%s\n' "$OWNER_DETAILS" | sed 's/^/  /')
+
+setup.sh stopped here, before registering this sink with the PMM Server at
+${PMM_SERVER}. Registering runs 'pmm-admin config --force', which would delete
+that node together with all of its services and agents.
+
+What to do (whichever fits):
+  - That node is another sink that's still running (for example a second sink
+    with the same hostname): give this sink its own name. Set
+    PMM_NODE_NAME=<unique name> in .env, then re-run: bash setup.sh
+  - That node was left behind by a Droplet that no longer exists (for example
+    the sink this Droplet replaces): replace it with
+      PMM_FORCE_REREGISTER=1 bash setup.sh
+    PMM can keep showing a deleted Droplet's agent as connected for several
+    minutes, so "shown as connected" above doesn't prove that Droplet is still
+    running; check that no Droplet still has the address shown.
+  - Or remove the old node first (bash destruct.sh on its Droplet, or delete
+    the node in PMM under Inventory -> Nodes), then re-run: bash setup.sh
+
 MSG
+        report_changes_so_far >&2
         exit 1
       fi
       ;;
@@ -195,9 +250,27 @@ MSG
       if [ "$PMM_FORCE_REREGISTER" = "1" ]; then
         echo "WARNING: couldn't verify who owns node '${PMM_NODE_NAME}' (see above); continuing because PMM_FORCE_REREGISTER=1." >&2
       else
-        echo "ERROR: couldn't verify whether node '${PMM_NODE_NAME}' belongs to another machine (see above)," >&2
-        echo "  so registering could silently remove it. Fix PMM_SERVER/PMM_TOKEN, or re-run with" >&2
-        echo "  PMM_FORCE_REREGISTER=1 if you're sure. Nothing has been changed." >&2
+        cat >&2 <<MSG
+ERROR: couldn't check whether a PMM node named '${PMM_NODE_NAME}' belongs to
+another machine (the PMM API error is shown above).
+
+setup.sh stopped here, before registering this sink with the PMM Server at
+${PMM_SERVER}. Registering runs 'pmm-admin config --force', which would delete
+an existing node with this name together with its services and agents, so it
+won't register without knowing whose that node is.
+
+What to do:
+  - Check that PMM_SERVER in .env is this PMM Server's address and that it
+    answers on port 443 from here (expect 200):
+      curl -sk -o /dev/null -w '%{http_code}\n' https://${PMM_SERVER}/v1/server/readyz
+  - Check that PMM_TOKEN in .env is a current service-account token with the
+    Admin role; an HTTP 401 or 403 above means it isn't (RUNBOOK Step 1).
+  - Then re-run: bash setup.sh
+  - Only if you're certain no other machine uses this node name, you can skip
+    the check: PMM_FORCE_REREGISTER=1 bash setup.sh
+
+MSG
+        report_changes_so_far >&2
         exit 1
       fi
       ;;
@@ -210,11 +283,23 @@ if [ "$PMM_FORCE_REREGISTER" != "1" ]; then
   if [ "$SVC_RC" -eq 2 ]; then
     cat >&2 <<MSG
 ERROR: PMM service name '${PMM_SERVICE_NAME}' is already used by another node:
-  ${SVC_DETAILS}
-PMM service names must be unique per PMM Server. Set PMM_SERVICE_NAME=<unique
-name> in .env for this endpoint (RUNBOOK: "Monitoring multiple Managed MySQL
-endpoints with one PMM Server"). Nothing has been changed.
+$(printf '%s\n' "$SVC_DETAILS" | sed 's/^/  /')
+
+setup.sh stopped here, before registering this sink with the PMM Server at
+${PMM_SERVER}. Service names must be unique on a PMM Server, so this endpoint
+can't be registered under the same name.
+
+What to do (whichever fits):
+  - That service is another endpoint's (another sink's): give this endpoint its
+    own name. Set PMM_SERVICE_NAME=<unique name> in .env, then re-run:
+    bash setup.sh (RUNBOOK: "Monitoring multiple Managed MySQL endpoints with
+    one PMM Server").
+  - That service is this same endpoint's, registered by a sink that no longer
+    exists: delete it, or its node, in PMM under Inventory, then re-run:
+    bash setup.sh
+
 MSG
+    report_changes_so_far >&2
     exit 1
   elif [ "$SVC_RC" -eq 3 ]; then
     echo "WARNING: couldn't check whether service name '${PMM_SERVICE_NAME}' is free (see above); continuing." >&2
